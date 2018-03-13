@@ -2,11 +2,12 @@ from __future__ import print_function
 from collections import namedtuple
 import numpy as np
 import tensorflow as tf
-from model import LSTMPolicy
+from model import CnnPolicy
 import six.moves.queue as queue
 import scipy.signal
 import threading
 import distutils.version
+import cv2
 use_tf12_api = distutils.version.LooseVersion(tf.VERSION) >= distutils.version.LooseVersion('0.12.0')
 
 def discount(x, gamma):
@@ -16,19 +17,17 @@ def process_rollout(rollout, gamma, lambda_=1.0):
     """
 given a rollout, compute its returns and the advantage
 """
-    batch_si = np.asarray(rollout.states)
-    batch_a = np.asarray(rollout.actions)
-    rewards = np.asarray(rollout.rewards)
-    vpred_t = np.asarray(rollout.values + [rollout.r])
-
-    rewards_plus_v = np.asarray(rollout.rewards + [rollout.r])
-    batch_r = discount(rewards_plus_v, gamma)[:-1]
+    batch_si = np.squeeze(rollout.states).reshape(-1, 84, 84, 4)
+    batch_a = np.squeeze(np.asarray(rollout.actions)).reshape(-1, 6)
+    rewards = np.squeeze(np.asarray(rollout.rewards)).reshape(-1)
+    vpred_t = np.squeeze(np.asarray(rollout.values + [rollout.r]))
+    rewards_plus_v = np.squeeze(np.asarray(rollout.rewards + [rollout.r]))
+    batch_r = np.squeeze(discount(rewards_plus_v, gamma)[:-1]).reshape(-1)
     delta_t = rewards + gamma * vpred_t[1:] - vpred_t[:-1]
     # this formula for the advantage comes "Generalized Advantage Estimation":
     # https://arxiv.org/abs/1506.02438
     batch_adv = discount(delta_t, gamma * lambda_)
-
-    features = rollout.features[0]
+    features = None
     return Batch(batch_si, batch_a, batch_adv, batch_r, rollout.terminal, features)
 
 Batch = namedtuple("Batch", ["si", "a", "adv", "r", "terminal", "features"])
@@ -53,7 +52,7 @@ once it has processed enough steps.
         self.rewards += [reward]
         self.values += [value]
         self.terminal = terminal
-        self.features += [features]
+        #self.features += [features]
 
     def extend(self, other):
         assert not self.terminal
@@ -98,10 +97,7 @@ that would constantly interact with the environment and tell it what to do.  Thi
             # the timeout variable exists because apparently, if one worker dies, the other workers
             # won't die with it, unless the timeout is set to some large number.  This is an empirical
             # observation.
-
             self.queue.put(next(rollout_provider), timeout=600.0)
-
-
 
 def env_runner(env, policy, num_local_steps, summary_writer, render):
     """
@@ -110,7 +106,7 @@ the policy, and as long as the rollout exceeds a certain length, the thread
 runner appends the policy to the queue.
 """
     last_state = env.reset()
-    last_features = policy.get_initial_features()
+    last_features = None
     length = 0
     rewards = 0
 
@@ -119,10 +115,12 @@ runner appends the policy to the queue.
         rollout = PartialRollout()
 
         for _ in range(num_local_steps):
-            fetched = policy.act(last_state, *last_features)
+            fetched = policy.step(last_state)
             action, value_, features = fetched[0], fetched[1], fetched[2:]
             # argmax to convert from one-hot
-            state, reward, terminal, info = env.step(action.argmax())
+            state, reward, terminal, info = env.step([action.argmax()])
+            state = state.astype(np.float32)
+            # cv2.imwrite('/tmp/pong/train/state.jpg', (state * 255).astype(np.uint8))
             if render:
                 env.render()
 
@@ -134,26 +132,20 @@ runner appends the policy to the queue.
             last_state = state
             last_features = features
 
-            if info:
+            if terminal:
+                terminal_end = True
+                last_state = env.reset()
+                print("Episode finished. Sum of rewards: %d. Length: %d" % (rewards, length))
                 summary = tf.Summary()
-                for k, v in info.items():
-                    summary.value.add(tag=k, simple_value=float(v))
+                summary.value.add(tag='episode reward', simple_value=rewards[-1])
                 summary_writer.add_summary(summary, policy.global_step.eval())
                 summary_writer.flush()
-
-            timestep_limit = env.spec.tags.get('wrapper_config.TimeLimit.max_episode_steps')
-            if terminal or length >= timestep_limit:
-                terminal_end = True
-                if length >= timestep_limit or not env.metadata.get('semantics.autoreset'):
-                    last_state = env.reset()
-                last_features = policy.get_initial_features()
-                print("Episode finished. Sum of rewards: %d. Length: %d" % (rewards, length))
                 length = 0
                 rewards = 0
                 break
 
         if not terminal_end:
-            rollout.r = policy.value(last_state, *last_features)
+            rollout.r = policy.value(last_state)[0]
 
         # once we have enough experience, yield it, and have the ThreadRunner place it on a queue
         yield rollout
@@ -169,16 +161,18 @@ should be computed.
 
         self.env = env
         self.task = task
+        ob_space = self.env.observation_space
+        ac_space = self.env.action_space
         worker_device = "/job:worker/task:{}/cpu:0".format(task)
         with tf.device(tf.train.replica_device_setter(1, worker_device=worker_device)):
             with tf.variable_scope("global"):
-                self.network = LSTMPolicy(env.observation_space.shape, env.action_space.n)
+                self.network = CnnPolicy(ob_space, ac_space, 1, 1, reuse=False)
                 self.global_step = tf.get_variable("global_step", [], tf.int32, initializer=tf.constant_initializer(0, dtype=tf.int32),
                                                    trainable=False)
 
         with tf.device(worker_device):
             with tf.variable_scope("local"):
-                self.local_network = pi = LSTMPolicy(env.observation_space.shape, env.action_space.n)
+                self.local_network = pi = CnnPolicy(ob_space, ac_space, 1, 1, reuse=False)
                 pi.global_step = self.global_step
 
             self.ac = tf.placeholder(tf.float32, [None, env.action_space.n], name="ac")
@@ -191,10 +185,11 @@ should be computed.
             # the "policy gradients" loss:  its derivative is precisely the policy gradient
             # notice that self.ac is a placeholder that is provided externally.
             # adv will contain the advantages, as calculated in process_rollout
-            pi_loss = - tf.reduce_sum(tf.reduce_sum(log_prob_tf * self.ac, [1]) * self.adv)
+            pi_loss = - tf.reduce_mean(tf.reduce_sum(log_prob_tf * self.ac, [1]) * self.adv)
 
             # loss of value function
-            vf_loss = 0.5 * tf.reduce_sum(tf.square(pi.vf - self.r))
+            vf_loss = 0.5 * tf.reduce_mean(tf.square(pi.vf - self.r))
+            print(vf_loss.get_shape(), pi.vf.get_shape())
             entropy = - tf.reduce_sum(prob_tf * log_prob_tf)
 
             bs = tf.to_float(tf.shape(pi.x)[0])
@@ -211,25 +206,32 @@ should be computed.
 
             grads = tf.gradients(self.loss, pi.var_list)
 
-            if use_tf12_api:
-                tf.summary.scalar("model/policy_loss", pi_loss / bs)
-                tf.summary.scalar("model/value_loss", vf_loss / bs)
-                tf.summary.scalar("model/entropy", entropy / bs)
-                tf.summary.image("model/state", pi.x)
-                tf.summary.scalar("model/grad_global_norm", tf.global_norm(grads))
-                tf.summary.scalar("model/var_global_norm", tf.global_norm(pi.var_list))
-                self.summary_op = tf.summary.merge_all()
+            # summ = tf.Summary()
+            # summ.value.add(tag="model/policy_loss", simple_value=pi_loss / bs)
+            # summ.value.add(tag="model/value_loss", simple_value=vf_loss / bs)
+            # summ.value.add(tag="model/entropy", simple_value=entropy / bs)
+            # summ.value.add(tag="model/state", simple_value=pi.x)
+            # summ.value.add(tag="model/grad_global_norm", simple_value=tf.global_norm(grads))
+            # summ.value.add(tag="model/var_global_norm", simple_value=tf.global_norm(pi.var_list))
+            # if use_tf12_api:
+            tf.summary.scalar("model/policy_loss", pi_loss / bs)
+            tf.summary.scalar("model/value_loss", vf_loss / bs)
+            tf.summary.scalar("model/entropy", entropy / bs)
+            tf.summary.image("model/state", pi.x)
+            tf.summary.scalar("model/grad_global_norm", tf.global_norm(grads))
+            tf.summary.scalar("model/var_global_norm", tf.global_norm(pi.var_list))
+            self.summary_op = tf.summary.merge_all()
 
-            else:
-                tf.scalar_summary("model/policy_loss", pi_loss / bs)
-                tf.scalar_summary("model/value_loss", vf_loss / bs)
-                tf.scalar_summary("model/entropy", entropy / bs)
-                tf.image_summary("model/state", pi.x)
-                tf.scalar_summary("model/grad_global_norm", tf.global_norm(grads))
-                tf.scalar_summary("model/var_global_norm", tf.global_norm(pi.var_list))
-                self.summary_op = tf.merge_all_summaries()
+            # else:
+            #     tf.scalar_summary("model/policy_loss", pi_loss / bs)
+            #     tf.scalar_summary("model/value_loss", vf_loss / bs)
+            #     tf.scalar_summary("model/entropy", entropy / bs)
+            #     tf.image_summary("model/state", pi.x)
+            #     tf.scalar_summary("model/grad_global_norm", tf.global_norm(grads))
+            #     tf.scalar_summary("model/var_global_norm", tf.global_norm(pi.var_list))
+            # self.summary_op = tf.merge_all()
 
-            grads, _ = tf.clip_by_global_norm(grads, 40.0)
+            grads, _ = tf.clip_by_global_norm(grads, 0.5)
 
             # copy weights from the parameter server to the local model
             self.sync = tf.group(*[v1.assign(v2) for v1, v2 in zip(pi.var_list, self.network.var_list)])
@@ -238,7 +240,7 @@ should be computed.
             inc_step = self.global_step.assign_add(tf.shape(pi.x)[0])
 
             # each worker has a different set of adam optimizer parameters
-            opt = tf.train.AdamOptimizer(1e-4)
+            opt = tf.train.AdamOptimizer(7e-4)
             self.train_op = tf.group(opt.apply_gradients(grads_and_vars), inc_step)
             self.summary_writer = None
             self.local_steps = 0
@@ -281,9 +283,7 @@ server.
             self.local_network.x: batch.si,
             self.ac: batch.a,
             self.adv: batch.adv,
-            self.r: batch.r,
-            self.local_network.state_in[0]: batch.features[0],
-            self.local_network.state_in[1]: batch.features[1],
+            self.r: batch.r
         }
 
         fetched = sess.run(fetches, feed_dict=feed_dict)

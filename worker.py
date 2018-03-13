@@ -7,9 +7,11 @@ import logging
 import sys, signal
 import time
 import os
-from a3c import A3C
-from envs import create_env
+from a3c2 import A3C
 import distutils.version
+
+from baselines.common.vec_env.vec_frame_stack import VecFrameStack
+from baselines.common.cmd_util import make_atari_env
 use_tf12_api = distutils.version.LooseVersion(tf.VERSION) >= distutils.version.LooseVersion('0.12.0')
 
 logger = logging.getLogger(__name__)
@@ -23,7 +25,7 @@ class FastSaver(tf.train.Saver):
                                     meta_graph_suffix, False)
 
 def run(args, server):
-    env = create_env(args.env_id, client_id=str(args.task), remotes=args.remotes)
+    env = VecFrameStack(make_atari_env(args.env_id, 1, 12345), 4)
     trainer = A3C(env, args.task, args.visualise)
 
     # Variable names that start with "local" are not saved in checkpoints.
@@ -73,11 +75,12 @@ def run(args, server):
         "Starting session. If this hangs, we're mostly likely waiting to connect to the parameter server. " +
         "One common cause is that the parameter server DNS name isn't resolving yet, or is misspecified.")
     with sv.managed_session(server.target, config=config) as sess, sess.as_default():
-        sess.run(trainer.sync)
-        trainer.start(sess, summary_writer)
+        trainer.setup(sess, summary_writer)
         global_step = sess.run(trainer.global_step)
         logger.info("Starting training at step=%d", global_step)
         while not sv.should_stop() and (not num_global_steps or global_step < num_global_steps):
+            sess.run(trainer.sync)
+            trainer.gather_episode(sess)
             trainer.process(sess)
             global_step = sess.run(trainer.global_step)
 
